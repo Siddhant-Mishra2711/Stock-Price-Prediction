@@ -11,7 +11,7 @@ import yfinance as yf
 import os
 
 # Define ticker, start date, and end date
-ticker = 'ARVIND.NS'
+ticker = 'META'
 start_date = '2010-01-01'
 end_date = '2024-11-20'
 
