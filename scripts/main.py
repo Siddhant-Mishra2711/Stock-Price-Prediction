@@ -1,9 +1,8 @@
-# Import Required Libraries
+# Import Required Libraries 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from keras.models import Sequential
 from keras.layers import LSTM, Dense, Dropout, Input
@@ -12,9 +11,9 @@ import yfinance as yf
 import os
 
 # Define ticker, start date, and end date
-ticker = 'META'
+ticker = 'ARVIND.NS'
 start_date = '2010-01-01'
-end_date = '2024-01-01'
+end_date = '2024-11-20'
 
 # Ensure 'data' directory exists
 os.makedirs('data', exist_ok=True)
@@ -77,7 +76,7 @@ model = Sequential([
 model.compile(optimizer='adam', loss='mean_squared_error')
 
 # Implement Early Stopping
-early_stop = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
+early_stop = EarlyStopping(monitor='val_loss', patience=30, restore_best_weights=True)
 
 # Train the model with validation
 history = model.fit(X_train, y_train, epochs=50, batch_size=32, 
@@ -85,15 +84,6 @@ history = model.fit(X_train, y_train, epochs=50, batch_size=32,
 
 # Save the model after training
 model.save('models/lstm_stock_model.keras')
-
-# Make predictions
-y_pred = model.predict(X_test)
-y_pred_inverse = scaler.inverse_transform(np.concatenate((y_pred, test_data[time_step:, 1:]), axis=1))[:, 0]
-
-# Calculate metrics
-mse = mean_squared_error(scaler.inverse_transform(test_data[time_step:])[:, 0], y_pred_inverse)
-mae = mean_absolute_error(scaler.inverse_transform(test_data[time_step:])[:, 0], y_pred_inverse)
-print(f'MSE: {mse}, MAE: {mae}')
 
 # Plot training history
 plt.figure(figsize=(12, 6))
@@ -105,6 +95,15 @@ plt.ylabel('Loss')
 plt.legend()
 plt.show()
 
+# Make predictions
+y_pred = model.predict(X_test)
+y_pred_inverse = scaler.inverse_transform(np.concatenate((y_pred, test_data[time_step:, 1:]), axis=1))[:, 0]
+
+# Calculate metrics
+mse = mean_squared_error(scaler.inverse_transform(test_data[time_step:])[:, 0], y_pred_inverse)
+mae = mean_absolute_error(scaler.inverse_transform(test_data[time_step:])[:, 0], y_pred_inverse)
+print(f'MSE: {mse}, MAE: {mae}')
+
 # Plot actual vs predicted
 test_dates = data.index[train_size + time_step:]
 plt.figure(figsize=(14,5))
@@ -115,42 +114,78 @@ plt.ylabel('Stock Price')
 plt.legend()
 plt.show()
 
-# Trading Signals
-test_data_df = data.iloc[train_size + time_step:].copy()
-test_data_df['Predicted Price'] = y_pred_inverse
-test_data_df['Signal'] = 0
-test_data_df.loc[test_data_df['Predicted Price'] > test_data_df['MA50'], 'Signal'] = 1  # Buy signal
-test_data_df.loc[test_data_df['Predicted Price'] < test_data_df['MA50'], 'Signal'] = -1  # Sell signal
+# Future Prediction - Predicting next N days
+def predict_future(model, last_data, n_days, time_step=60):
+    future_preds = []
+    current_input = last_data[-time_step:].reshape(1, time_step, len(features))  # Reshape for LSTM input
+    for _ in range(n_days):
+        future_pred = model.predict(current_input)[0][0]  # Predict next step
+        future_preds.append(future_pred)
+        
+        # Prepare next input for prediction:
+        future_input = np.zeros((1, time_step, len(features)))  # Create a new array of zeros
+        future_input[0, :-1, 0] = current_input[0, 1:, 0]  # Shift the values in the current input
+        future_input[0, -1, 0] = future_pred  # Append the predicted value to the last time step
+        
+        # Copy the other features (e.g., MA50, MA200, Volatility)
+        future_input[0, :-1, 1:] = current_input[0, 1:, 1:]  # Copy other features as they are
+        current_input = future_input  # Update input for next prediction
+    
+    return future_preds
 
-# Display signals
-print(test_data_df[['Close', 'Predicted Price', 'MA50', 'Signal']])
+# Predict for next 30 days
+n_days = 30
+future_preds = predict_future(model, scaled_data, n_days)
+future_preds_inverse = scaler.inverse_transform(np.concatenate((np.array(future_preds).reshape(-1, 1), np.zeros((n_days, len(features) - 1))), axis=1))[:, 0]
 
-# Plotting with buy/sell signals
+# Plot future predictions
+future_dates = pd.date_range(start=test_dates[-1] + pd.Timedelta(days=1), periods=n_days, freq='D')
+plt.figure(figsize=(14, 5))
+plt.plot(test_dates, scaler.inverse_transform(test_data[time_step:])[:, 0], label='Actual Price', color='blue')
+plt.plot(test_dates, y_pred_inverse, label='Predicted Price', color='red')
+plt.plot(future_dates, future_preds_inverse, label=f'Future Predictions ({n_days} days)', color='green', linestyle='--')
+plt.xlabel('Date')
+plt.ylabel('Stock Price')
+plt.legend()
+plt.title('Stock Price Prediction and Future Predictions')
+plt.show()
+
+# Generate buy/sell signals for the predicted future prices
+future_signals = pd.DataFrame({
+    'Date': future_dates,
+    'Predicted Price': future_preds_inverse,
+    'Signal': 0
+})
+
+# Signal: Buy if predicted price is above MA50, Sell if below
+future_signals.loc[future_signals['Predicted Price'] > data['MA50'].iloc[-1], 'Signal'] = 1  # Buy signal
+future_signals.loc[future_signals['Predicted Price'] < data['MA50'].iloc[-1], 'Signal'] = -1  # Sell signal
+
+# Plot future trading signals
 plt.figure(figsize=(14, 8))
+plt.plot(test_dates, scaler.inverse_transform(test_data[time_step:])[:, 0], label='Actual Price', color='blue', linewidth=1.5)
+plt.plot(test_dates, y_pred_inverse, label='Predicted Price', color='red', linestyle='--', linewidth=1.5)
+plt.plot(future_dates, future_preds_inverse, label='Future Predicted Price', color='green', linestyle='--', linewidth=1.5)
 
-# Plot the actual closing prices
-plt.plot(test_data_df.index, test_data_df['Close'], label='Actual Price', color='blue', linewidth=1.5)
-
-# Plot the predicted prices
-plt.plot(test_data_df.index, test_data_df['Predicted Price'], label='Predicted Price', color='red', linestyle='--', linewidth=1.5)
-
-# Plot the 50-day moving average
-plt.plot(test_data_df.index, test_data_df['MA50'], label='50-Day MA', color='green', linewidth=1.5)
-
-# Plot Buy signals
-plt.plot(test_data_df[test_data_df['Signal'] == 1].index,
-         test_data_df[test_data_df['Signal'] == 1]['Close'],
+# Plot future buy/sell signals
+plt.plot(future_signals[future_signals['Signal'] == 1]['Date'],
+         future_signals[future_signals['Signal'] == 1]['Predicted Price'],
          '^', markersize=10, color='green', label='Buy Signal')
 
-# Plot Sell signals
-plt.plot(test_data_df[test_data_df['Signal'] == -1].index,
-         test_data_df[test_data_df['Signal'] == -1]['Close'],
+plt.plot(future_signals[future_signals['Signal'] == -1]['Date'],
+         future_signals[future_signals['Signal'] == -1]['Predicted Price'],
          'v', markersize=10, color='red', label='Sell Signal')
 
-# Add labels and title
-plt.title('Stock Price Prediction with Buy/Sell Signals')
+plt.title('Future Stock Price Prediction with Buy/Sell Signals')
 plt.xlabel('Date')
-plt.ylabel('Price')
+plt.ylabel('Stock Price')
 plt.legend()
 plt.xticks(rotation=45)
-plt.show() 
+plt.show()
+
+# Print the future predicted stock values and signals
+print("Future Predicted Stock Prices and Buy/Sell Signals:")
+print(future_signals[['Date', 'Predicted Price', 'Signal']])
+
+
+
