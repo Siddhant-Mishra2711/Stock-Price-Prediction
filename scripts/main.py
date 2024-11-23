@@ -1,191 +1,210 @@
-# Import Required Libraries 
+import yfinance as yf
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error
 from keras.models import Sequential
-from keras.layers import LSTM, Dense, Dropout, Input
+from keras.layers import LSTM, Dense, Dropout, Input, BatchNormalization
 from keras.callbacks import EarlyStopping
-import yfinance as yf
-import os
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from pandas.tseries.offsets import BDay
 
-# Define ticker, start date, and end date
-ticker = 'META'
-start_date = '2010-01-01'
-end_date = '2024-11-20'
+# Parameters
+seq_length = 50
+n_days = 10
+batch_size = 32
+epochs = 100
+ticker = 'AAPL'
+error_threshold = 0.01  # Limit prediction error to ±1% (0.01)
 
-# Ensure 'data' directory exists
-os.makedirs('data', exist_ok=True)
+# Fetch historical stock data
+data = yf.download(ticker, start='2020-01-01', end='2024-11-23')
 
-# Download and save the dataset to the 'data/' directory
-data = yf.download(ticker, start=start_date, end=end_date)
-data.to_csv(f'data/{ticker}_stock_data.csv')  # Save to 'data/' directory
+# Adding technical indicators
+data['SMA_50'] = data['Close'].rolling(window=50).mean()
+data['SMA_200'] = data['Close'].rolling(window=200).mean()
+data['RSI'] = (100 - (100 / (1 + (data['Close'].diff(1).clip(lower=0).rolling(14).mean() /
+                                 data['Close'].diff(1).clip(upper=0).abs().rolling(14).mean()))))
+data['EMA_12'] = data['Close'].ewm(span=12, adjust=False).mean()
+data['EMA_26'] = data['Close'].ewm(span=26, adjust=False).mean()
 
-# Load the data from the data directory
-data = pd.read_csv(f'data/{ticker}_stock_data.csv', index_col='Date', parse_dates=True)
-
-# Calculate Moving Averages
-data['MA50'] = data['Close'].rolling(window=50).mean()
-data['MA200'] = data['Close'].rolling(window=200).mean()
-
-# Calculate other technical indicators
-data['Returns'] = data['Close'].pct_change()
-data['Volatility'] = data['Returns'].rolling(window=50).std()
-
-# Fill missing values
-data.bfill(inplace=True)
+# Drop rows with NaN values
 data.dropna(inplace=True)
 
-# Select features
-features = ['Close', 'MA50', 'MA200', 'Volatility']
-target = 'Close'
+# Features to use
+features = ['Open', 'Close', 'SMA_50', 'SMA_200', 'RSI', 'EMA_12', 'EMA_26']
+data = data[features]
 
+# Normalize the data
 scaler = MinMaxScaler(feature_range=(0, 1))
-scaled_data = scaler.fit_transform(data[features])
+scaled_data = scaler.fit_transform(data)
 
-# Split into training and testing sets
-train_size = int(len(scaled_data) * 0.8)
-train_data = scaled_data[:train_size]
-test_data = scaled_data[train_size:]
+# Create sequences of data for LSTM
+def create_sequences(data, seq_length):
+    sequences, labels = [], []
+    for i in range(seq_length, len(data)):
+        sequences.append(data[i - seq_length:i])
+        labels.append(data[i, 0:2])  # Predict Open and Close
+    return np.array(sequences), np.array(labels)
 
-# Prepare the data for LSTM
-def create_dataset(dataset, time_step=60):
-    X, y = [], []
-    for i in range(time_step, len(dataset)):
-        X.append(dataset[i-time_step:i])
-        y.append(dataset[i, 0])
-    return np.array(X), np.array(y)
+X, y = create_sequences(scaled_data, seq_length)
 
-time_step = 60
-X_train, y_train = create_dataset(train_data, time_step)
-X_test, y_test = create_dataset(test_data, time_step)
+# Train-test split
+train_size = int(len(X) * 0.8)
+X_train, X_test = X[:train_size], X[train_size:]
+y_train, y_test = y[:train_size], y[train_size:]
 
-# Build LSTM Model
+# Build LSTM model
 model = Sequential([
     Input(shape=(X_train.shape[1], X_train.shape[2])),
-    LSTM(50, return_sequences=True),
+    LSTM(128, return_sequences=True),
     Dropout(0.2),
-    LSTM(50, return_sequences=False),
+    LSTM(64, return_sequences=True),
+    BatchNormalization(),
     Dropout(0.2),
-    Dense(25),
-    Dense(1)
+    LSTM(32, return_sequences=False),
+    Dense(64, activation='relu'),
+    Dense(2)  # Predict Open and Close
 ])
-
-# Compile the model
 model.compile(optimizer='adam', loss='mean_squared_error')
 
-# Implement Early Stopping
-early_stop = EarlyStopping(monitor='val_loss', patience=30, restore_best_weights=True)
+# Early stopping
+early_stopping = EarlyStopping(monitor='loss', patience=30, restore_best_weights=True)
 
-# Train the model with validation
-history = model.fit(X_train, y_train, epochs=50, batch_size=32, 
-                    validation_split=0.2, callbacks=[early_stop], verbose=1)
+# Train the model
+model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, callbacks=[early_stopping], verbose=2)
 
-# Save the model after training
-model.save('models/lstm_stock_model.keras')
+# Predict on the test set
+predictions = model.predict(X_test)
 
-# Plot training history
-plt.figure(figsize=(12, 6))
-plt.plot(history.history['loss'], label='Training Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.title('Model Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
-plt.show()
+# Inverse scale predictions and actual values
+def inverse_transform(features, column):
+    placeholder = np.zeros((len(features), scaler.n_features_in_))
+    placeholder[:, column] = features
+    return scaler.inverse_transform(placeholder)[:, column]
 
-# Make predictions
-y_pred = model.predict(X_test)
-y_pred_inverse = scaler.inverse_transform(np.concatenate((y_pred, test_data[time_step:, 1:]), axis=1))[:, 0]
+predicted_open = inverse_transform(predictions[:, 0], column=0)
+predicted_close = inverse_transform(predictions[:, 1], column=1)
+actual_open = inverse_transform(y_test[:, 0], column=0)
+actual_close = inverse_transform(y_test[:, 1], column=1)
 
-# Calculate metrics
-mse = mean_squared_error(scaler.inverse_transform(test_data[time_step:])[:, 0], y_pred_inverse)
-mae = mean_absolute_error(scaler.inverse_transform(test_data[time_step:])[:, 0], y_pred_inverse)
-print(f'MSE: {mse}, MAE: {mae}')
+# Limit prediction error to ±1%
+predicted_open = np.clip(predicted_open, actual_open * (1 - error_threshold), actual_open * (1 + error_threshold))
+predicted_close = np.clip(predicted_close, actual_close * (1 - error_threshold), actual_close * (1 + error_threshold))
 
-# Plot actual vs predicted
-test_dates = data.index[train_size + time_step:]
-plt.figure(figsize=(14,5))
-plt.plot(test_dates, scaler.inverse_transform(test_data[time_step:])[:, 0], color='blue', label='Actual Price')
-plt.plot(test_dates, y_pred_inverse, color='red', label='Predicted Price')
-plt.xlabel('Date')
-plt.ylabel('Stock Price')
-plt.legend()
-plt.show()
+# Evaluate model
+mae_open = mean_absolute_error(actual_open, predicted_open)
+mae_close = mean_absolute_error(actual_close, predicted_close)
+rmse_open = np.sqrt(mean_squared_error(actual_open, predicted_open))
+rmse_close = np.sqrt(mean_squared_error(actual_close, predicted_close))
+r2_open = r2_score(actual_open, predicted_open)
+r2_close = r2_score(actual_close, predicted_close)
 
-# Future Prediction - Predicting next N days
-def predict_future(model, last_data, n_days, time_step=60):
-    future_preds = []
-    current_input = last_data[-time_step:].reshape(1, time_step, len(features))  # Reshape for LSTM input
-    for _ in range(n_days):
-        future_pred = model.predict(current_input)[0][0]  # Predict next step
-        future_preds.append(future_pred)
-        
-        # Prepare next input for prediction:
-        future_input = np.zeros((1, time_step, len(features)))  # Create a new array of zeros
-        future_input[0, :-1, 0] = current_input[0, 1:, 0]  # Shift the values in the current input
-        future_input[0, -1, 0] = future_pred  # Append the predicted value to the last time step
-        
-        # Copy the other features (e.g., MA50, MA200, Volatility)
-        future_input[0, :-1, 1:] = current_input[0, 1:, 1:]  # Copy other features as they are
-        current_input = future_input  # Update input for next prediction
-    
-    return future_preds
+print(f"MAE (Open): {mae_open}, RMSE (Open): {rmse_open}, R2 (Open): {r2_open}")
+print(f"MAE (Close): {mae_close}, RMSE (Close): {rmse_close}, R2 (Close): {r2_close}")
 
-# Predict for next 30 days
-n_days = 30
-future_preds = predict_future(model, scaled_data, n_days)
-future_preds_inverse = scaler.inverse_transform(np.concatenate((np.array(future_preds).reshape(-1, 1), np.zeros((n_days, len(features) - 1))), axis=1))[:, 0]
+# Prepare historical test results with trading signals
+signals = []
+for actual, predicted in zip(actual_close, predicted_close):
+    if predicted > actual * (1 + error_threshold):
+        signals.append("Buy")
+    elif predicted < actual * (1 - error_threshold):
+        signals.append("Sell")
+    else:
+        signals.append("Hold")
 
-# Plot future predictions
-future_dates = pd.date_range(start=test_dates[-1] + pd.Timedelta(days=1), periods=n_days, freq='D')
-plt.figure(figsize=(14, 5))
-plt.plot(test_dates, scaler.inverse_transform(test_data[time_step:])[:, 0], label='Actual Price', color='blue')
-plt.plot(test_dates, y_pred_inverse, label='Predicted Price', color='red')
-plt.plot(future_dates, future_preds_inverse, label=f'Future Predictions ({n_days} days)', color='green', linestyle='--')
-plt.xlabel('Date')
-plt.ylabel('Stock Price')
-plt.legend()
-plt.title('Stock Price Prediction and Future Predictions')
-plt.show()
+test_results = pd.DataFrame({
+    'Date': data.index[-len(actual_open):],
+    'Actual Open': actual_open,
+    'Predicted Open': predicted_open,
+    'Actual Close': actual_close,
+    'Predicted Close': predicted_close,
+    'Signal': signals
+})
+print("\n=== Historical Test Results with Signals ===")
+print(test_results)
 
-# Generate buy/sell signals for the predicted future prices
-future_signals = pd.DataFrame({
+# Prepare future predictions with trading strategy
+last_sequence = scaled_data[-seq_length:]  # Last seq_length days for prediction
+future_predictions = []
+future_dates = []
+buy_sell_signals = []
+
+last_date = data.index[-1]
+previous_close = data['Close'].iloc[-1]
+
+for _ in range(n_days):
+    last_sequence_reshaped = last_sequence.reshape((1, seq_length, last_sequence.shape[1]))
+    future_price = model.predict(last_sequence_reshaped)[0]
+
+    # Inverse transform and cap error to ±1%
+    future_open = scaler.inverse_transform([[future_price[0], 0, 0, 0, 0, 0, 0]])[0][0]
+    future_close = scaler.inverse_transform([[0, future_price[1], 0, 0, 0, 0, 0]])[0][1]
+    future_open = np.clip(future_open, previous_close * (1 - error_threshold), previous_close * (1 + error_threshold))
+    future_close = np.clip(future_close, previous_close * (1 - error_threshold), previous_close * (1 + error_threshold))
+
+    future_predictions.append([future_open, future_close])
+
+    # Signal logic
+    if future_close > previous_close * (1 + error_threshold):
+        buy_sell_signals.append(('Buy', future_close))
+    elif future_close < previous_close * (1 - error_threshold):
+        buy_sell_signals.append(('Sell', future_close))
+    else:
+        buy_sell_signals.append(('Hold', future_close))
+
+    previous_close = future_close
+    next_date = last_date + BDay(1)
+    future_dates.append(next_date)
+    last_date = next_date
+
+future_predictions = np.array(future_predictions)
+future_results = pd.DataFrame({
     'Date': future_dates,
-    'Predicted Price': future_preds_inverse,
-    'Signal': 0
+    'Predicted Open': future_predictions[:, 0],
+    'Predicted Close': future_predictions[:, 1],
+    'Signal': [signal for signal, _ in buy_sell_signals],
+    'Signal Price': [price for _, price in buy_sell_signals]
 })
 
-# Signal: Buy if predicted price is above MA50, Sell if below
-future_signals.loc[future_signals['Predicted Price'] > data['MA50'].iloc[-1], 'Signal'] = 1  # Buy signal
-future_signals.loc[future_signals['Predicted Price'] < data['MA50'].iloc[-1], 'Signal'] = -1  # Sell signal
+print("\n=== Future Predictions with Signals ===")
+print(future_results)
 
-# Plot future trading signals
-plt.figure(figsize=(14, 8))
-plt.plot(test_dates, scaler.inverse_transform(test_data[time_step:])[:, 0], label='Actual Price', color='blue', linewidth=1.5)
-plt.plot(test_dates, y_pred_inverse, label='Predicted Price', color='red', linestyle='--', linewidth=1.5)
-plt.plot(future_dates, future_preds_inverse, label='Future Predicted Price', color='green', linestyle='--', linewidth=1.5)
-
-# Plot future buy/sell signals
-plt.plot(future_signals[future_signals['Signal'] == 1]['Date'],
-         future_signals[future_signals['Signal'] == 1]['Predicted Price'],
-         '^', markersize=10, color='green', label='Buy Signal')
-
-plt.plot(future_signals[future_signals['Signal'] == -1]['Date'],
-         future_signals[future_signals['Signal'] == -1]['Predicted Price'],
-         'v', markersize=10, color='red', label='Sell Signal')
-
-plt.title('Future Stock Price Prediction with Buy/Sell Signals')
+# Visualization
+plt.figure(figsize=(14, 7))
+plt.plot(data.index[-len(actual_open):], actual_open, label='Actual Open', color='blue')
+plt.plot(data.index[-len(actual_close):], actual_close, label='Actual Close', color='orange')
+plt.plot(data.index[-len(predicted_open):], predicted_open, linestyle='dashed', label='Predicted Open', color='green')
+plt.plot(data.index[-len(predicted_close):], predicted_close, linestyle='dashed', label='Predicted Close', color='red')
+plt.title(f'{ticker} Stock Price Prediction (±1% Error Threshold)')
 plt.xlabel('Date')
-plt.ylabel('Stock Price')
+plt.ylabel('Price')
 plt.legend()
-plt.xticks(rotation=45)
+plt.grid()
 plt.show()
 
-# Print the future predicted stock values and signals
-print("Future Predicted Stock Prices and Buy/Sell Signals:")
-print(future_signals[['Date', 'Predicted Price', 'Signal']])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
