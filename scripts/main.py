@@ -1,3 +1,4 @@
+# Import Necessary Libraries
 import yfinance as yf
 import numpy as np
 import pandas as pd
@@ -15,6 +16,7 @@ n_days = 10
 batch_size = 32
 epochs = 100
 ticker = 'AAPL'
+min_price_change = 0.01  # Minimum change in price (e.g., 1%)
 error_threshold = 0.01  # Limit prediction error to ±1% (0.01)
 
 # Fetch historical stock data
@@ -145,16 +147,18 @@ for _ in range(n_days):
 
     future_predictions.append([future_open, future_close])
 
-    # Signal logic
+    # Signal logic based on future prediction
     if future_close > previous_close * (1 + error_threshold):
         buy_sell_signals.append(('Buy', future_close))
     elif future_close < previous_close * (1 - error_threshold):
         buy_sell_signals.append(('Sell', future_close))
-    else:
+    elif abs(future_close - previous_close) > min_price_change:  # Only Hold if there's significant movement
         buy_sell_signals.append(('Hold', future_close))
+    else:
+        buy_sell_signals.append(('Hold', previous_close))
 
     previous_close = future_close
-    next_date = last_date + BDay(1)
+    next_date = last_date + BDay(1)  # Advance by one business day
     future_dates.append(next_date)
     last_date = next_date
 
@@ -170,13 +174,53 @@ future_results = pd.DataFrame({
 print("\n=== Future Predictions with Signals ===")
 print(future_results)
 
-# Visualization
+
+# Calculate bounds for the shaded region
+upper_open = predicted_open * (1 + error_threshold)
+lower_open = predicted_open * (1 - error_threshold)
+upper_close = predicted_close * (1 + error_threshold)
+lower_close = predicted_close * (1 - error_threshold)
+
+# Extract future predicted open and close prices
+future_predicted_open = future_predictions[:, 0]
+future_predicted_close = future_predictions[:, 1]
+
+# Calculate bounds for future predictions
+future_upper_open = future_predicted_open * (1 + error_threshold)
+future_lower_open = future_predicted_open * (1 - error_threshold)
+future_upper_close = future_predicted_close * (1 + error_threshold)
+future_lower_close = future_predicted_close * (1 - error_threshold)
+
+
+
+# Plot historical and future data with shaded uncertainty regions
 plt.figure(figsize=(14, 7))
 plt.plot(data.index[-len(actual_open):], actual_open, label='Actual Open', color='blue')
 plt.plot(data.index[-len(actual_close):], actual_close, label='Actual Close', color='orange')
 plt.plot(data.index[-len(predicted_open):], predicted_open, linestyle='dashed', label='Predicted Open', color='green')
 plt.plot(data.index[-len(predicted_close):], predicted_close, linestyle='dashed', label='Predicted Close', color='red')
-plt.title(f'{ticker} Stock Price Prediction (±1% Error Threshold)')
+
+# Plot future predictions
+plt.plot(future_dates, future_predicted_open, linestyle='dashed', label='Future Predicted Open', color='purple')
+plt.plot(future_dates, future_predicted_close, linestyle='dashed', label='Future Predicted Close', color='darkgreen')
+
+# Shaded regions for future predictions
+plt.fill_between(future_dates, future_lower_open, future_upper_open, color='olive', alpha=0.1)
+plt.fill_between(future_dates, future_lower_close, future_upper_close, color='magenta', alpha=0.1)
+
+# Initialize flags for unique legends
+buy_plotted, sell_plotted = False, False
+
+# Plot Buy/Sell/Hold signals
+for date, price, signal in zip(data.index[-len(actual_close):], predicted_close, signals):
+    if signal == "Buy":
+        plt.scatter(date, price, color='green', label='Buy Signal' if not buy_plotted else "", marker='^', s=100, edgecolors='black')
+        buy_plotted = True
+    elif signal == "Sell":
+        plt.scatter(date, price, color='red', label='Sell Signal' if not sell_plotted else "", marker='v', s=100, edgecolors='black')
+        sell_plotted = True
+
+plt.title(f'{ticker} Stock Price Prediction with Signals (±1% Error Threshold)')
 plt.xlabel('Date')
 plt.ylabel('Price')
 plt.legend()
