@@ -1,254 +1,533 @@
-# Import Necessary Libraries
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import yfinance as yf
-import numpy as np
+from datetime import datetime, timedelta
 import pandas as pd
-import matplotlib.pyplot as plt
+import json
+import os
+import numpy as np
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-from keras.models import Sequential
-from keras.layers import LSTM, Dense, Dropout, Input, BatchNormalization
-from keras.callbacks import EarlyStopping
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from pandas.tseries.offsets import BDay
-
-# Parameters
-seq_length = 50
-n_days = 10
-batch_size = 32
-epochs = 100
-ticker = 'AAPL'
-min_price_change = 0.01  # Minimum change in price (e.g., 1%)
-error_threshold = 0.01  # Limit prediction error to ±1% (0.01)
-
-# Fetch historical stock data
-data = yf.download(ticker, start='2020-01-01', end='2024-11-23')
-
-# Adding technical indicators
-data['SMA_50'] = data['Close'].rolling(window=50).mean()
-data['SMA_200'] = data['Close'].rolling(window=200).mean()
-data['RSI'] = (100 - (100 / (1 + (data['Close'].diff(1).clip(lower=0).rolling(14).mean() /
-                                 data['Close'].diff(1).clip(upper=0).abs().rolling(14).mean()))))
-data['EMA_12'] = data['Close'].ewm(span=12, adjust=False).mean()
-data['EMA_26'] = data['Close'].ewm(span=26, adjust=False).mean()
-
-# Drop rows with NaN values
-data.dropna(inplace=True)
-
-# Features to use
-features = ['Open', 'Close', 'SMA_50', 'SMA_200', 'RSI', 'EMA_12', 'EMA_26']
-data = data[features]
-
-# Normalize the data
-scaler = MinMaxScaler(feature_range=(0, 1))
-scaled_data = scaler.fit_transform(data)
-
-# Create sequences of data for LSTM
-def create_sequences(data, seq_length):
-    sequences, labels = [], []
-    for i in range(seq_length, len(data)):
-        sequences.append(data[i - seq_length:i])
-        labels.append(data[i, 0:2])  # Predict Open and Close
-    return np.array(sequences), np.array(labels)
-
-X, y = create_sequences(scaled_data, seq_length)
-
-# Train-test split
-train_size = int(len(X) * 0.8)
-X_train, X_test = X[:train_size], X[train_size:]
-y_train, y_test = y[:train_size], y[train_size:]
-
-# Build LSTM model
-model = Sequential([
-    Input(shape=(X_train.shape[1], X_train.shape[2])),
-    LSTM(128, return_sequences=True),
-    Dropout(0.2),
-    LSTM(64, return_sequences=True),
-    BatchNormalization(),
-    Dropout(0.2),
-    LSTM(32, return_sequences=False),
-    Dense(64, activation='relu'),
-    Dense(2)  # Predict Open and Close
-])
-model.compile(optimizer='adam', loss='mean_squared_error')
-
-# Early stopping
-early_stopping = EarlyStopping(monitor='loss', patience=30, restore_best_weights=True)
-
-# Train the model
-model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, callbacks=[early_stopping], verbose=2)
-
-# Predict on the test set
-predictions = model.predict(X_test)
-
-# Inverse scale predictions and actual values
-def inverse_transform(features, column):
-    placeholder = np.zeros((len(features), scaler.n_features_in_))
-    placeholder[:, column] = features
-    return scaler.inverse_transform(placeholder)[:, column]
-
-predicted_open = inverse_transform(predictions[:, 0], column=0)
-predicted_close = inverse_transform(predictions[:, 1], column=1)
-actual_open = inverse_transform(y_test[:, 0], column=0)
-actual_close = inverse_transform(y_test[:, 1], column=1)
-
-# Limit prediction error to ±1%
-predicted_open = np.clip(predicted_open, actual_open * (1 - error_threshold), actual_open * (1 + error_threshold))
-predicted_close = np.clip(predicted_close, actual_close * (1 - error_threshold), actual_close * (1 + error_threshold))
-
-# Evaluate model
-mae_open = mean_absolute_error(actual_open, predicted_open)
-mae_close = mean_absolute_error(actual_close, predicted_close)
-rmse_open = np.sqrt(mean_squared_error(actual_open, predicted_open))
-rmse_close = np.sqrt(mean_squared_error(actual_close, predicted_close))
-r2_open = r2_score(actual_open, predicted_open)
-r2_close = r2_score(actual_close, predicted_close)
-
-print(f"MAE (Open): {mae_open}, RMSE (Open): {rmse_open}, R2 (Open): {r2_open}")
-print(f"MAE (Close): {mae_close}, RMSE (Close): {rmse_close}, R2 (Close): {r2_close}")
-
-# Prepare historical test results with trading signals
-signals = []
-for actual, predicted in zip(actual_close, predicted_close):
-    if predicted > actual * (1 + error_threshold):
-        signals.append("Buy")
-    elif predicted < actual * (1 - error_threshold):
-        signals.append("Sell")
-    else:
-        signals.append("Hold")
-
-test_results = pd.DataFrame({
-    'Date': data.index[-len(actual_open):],
-    'Actual Open': actual_open,
-    'Predicted Open': predicted_open,
-    'Actual Close': actual_close,
-    'Predicted Close': predicted_close,
-    'Signal': signals
-})
-print("\n=== Historical Test Results with Signals ===")
-print(test_results)
-
-# Prepare future predictions with trading strategy
-last_sequence = scaled_data[-seq_length:]  # Last seq_length days for prediction
-future_predictions = []
-future_dates = []
-buy_sell_signals = []
-
-last_date = data.index[-1]
-previous_close = data['Close'].iloc[-1]
-
-for _ in range(n_days):
-    last_sequence_reshaped = last_sequence.reshape((1, seq_length, last_sequence.shape[1]))
-    future_price = model.predict(last_sequence_reshaped)[0]
-
-    # Inverse transform and cap error to ±1%
-    future_open = scaler.inverse_transform([[future_price[0], 0, 0, 0, 0, 0, 0]])[0][0]
-    future_close = scaler.inverse_transform([[0, future_price[1], 0, 0, 0, 0, 0]])[0][1]
-    future_open = np.clip(future_open, previous_close * (1 - error_threshold), previous_close * (1 + error_threshold))
-    future_close = np.clip(future_close, previous_close * (1 - error_threshold), previous_close * (1 + error_threshold))
-
-    future_predictions.append([future_open, future_close])
-
-    # Signal logic based on future prediction
-    if future_close > previous_close * (1 + error_threshold):
-        buy_sell_signals.append(('Buy', future_close))
-    elif future_close < previous_close * (1 - error_threshold):
-        buy_sell_signals.append(('Sell', future_close))
-    elif abs(future_close - previous_close) > min_price_change:  # Only Hold if there's significant movement
-        buy_sell_signals.append(('Hold', future_close))
-    else:
-        buy_sell_signals.append(('Hold', previous_close))
-
-    previous_close = future_close
-    next_date = last_date + BDay(1)  # Advance by one business day
-    future_dates.append(next_date)
-    last_date = next_date
-
-future_predictions = np.array(future_predictions)
-future_results = pd.DataFrame({
-    'Date': future_dates,
-    'Predicted Open': future_predictions[:, 0],
-    'Predicted Close': future_predictions[:, 1],
-    'Signal': [signal for signal, _ in buy_sell_signals],
-    'Signal Price': [price for _, price in buy_sell_signals]
-})
-
-print("\n=== Future Predictions with Signals ===")
-print(future_results)
-
-
-# Calculate bounds for the shaded region
-upper_open = predicted_open * (1 + error_threshold)
-lower_open = predicted_open * (1 - error_threshold)
-upper_close = predicted_close * (1 + error_threshold)
-lower_close = predicted_close * (1 - error_threshold)
-
-# Extract future predicted open and close prices
-future_predicted_open = future_predictions[:, 0]
-future_predicted_close = future_predictions[:, 1]
-
-# Calculate bounds for future predictions
-future_upper_open = future_predicted_open * (1 + error_threshold)
-future_lower_open = future_predicted_open * (1 - error_threshold)
-future_upper_close = future_predicted_close * (1 + error_threshold)
-future_lower_close = future_predicted_close * (1 - error_threshold)
-
-
-
-# Plot historical and future data with shaded uncertainty regions
-plt.figure(figsize=(14, 7))
-plt.plot(data.index[-len(actual_open):], actual_open, label='Actual Open', color='blue')
-plt.plot(data.index[-len(actual_close):], actual_close, label='Actual Close', color='orange')
-plt.plot(data.index[-len(predicted_open):], predicted_open, linestyle='dashed', label='Predicted Open', color='green')
-plt.plot(data.index[-len(predicted_close):], predicted_close, linestyle='dashed', label='Predicted Close', color='red')
-
-# Plot future predictions
-plt.plot(future_dates, future_predicted_open, linestyle='dashed', label='Future Predicted Open', color='purple')
-plt.plot(future_dates, future_predicted_close, linestyle='dashed', label='Future Predicted Close', color='darkgreen')
-
-# Shaded regions for future predictions
-plt.fill_between(future_dates, future_lower_open, future_upper_open, color='olive', alpha=0.1)
-plt.fill_between(future_dates, future_lower_close, future_upper_close, color='magenta', alpha=0.1)
-
-# Initialize flags for unique legends
-buy_plotted, sell_plotted = False, False
-
-# Plot Buy/Sell/Hold signals
-for date, price, signal in zip(data.index[-len(actual_close):], predicted_close, signals):
-    if signal == "Buy":
-        plt.scatter(date, price, color='green', label='Buy Signal' if not buy_plotted else "", marker='^', s=100, edgecolors='black')
-        buy_plotted = True
-    elif signal == "Sell":
-        plt.scatter(date, price, color='red', label='Sell Signal' if not sell_plotted else "", marker='v', s=100, edgecolors='black')
-        sell_plotted = True
-
-plt.title(f'{ticker} Stock Price Prediction with Signals (±1% Error Threshold)')
-plt.xlabel('Date')
-plt.ylabel('Price')
-plt.legend()
-plt.grid()
-plt.show()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Dense, LSTM
+
+app = Flask(__name__)
+CORS(app)
+
+MODEL_DIR = "models"
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+def download_data(ticker, start, end):
+    df = yf.download(ticker, start=start, end=end, interval="1d")
+    df.dropna(inplace=True)
+    return df
+
+def create_lstm_data(df, look_back=60):
+    data = df['Close'].values.reshape(-1, 1)
+    scaler = MinMaxScaler()
+    data_scaled = scaler.fit_transform(data)
+
+    X, y_class, y_reg = [], [], []
+    for i in range(look_back, len(data_scaled) - 1):
+        X.append(data_scaled[i - look_back:i])
+        price_today = data_scaled[i][0]
+        price_tomorrow = data_scaled[i + 1][0]
+        y_class.append(1 if price_tomorrow > price_today else 0)
+        y_reg.append(price_tomorrow)
+
+    return (
+        np.array(X),
+        np.array(y_class),
+        np.array(y_reg),
+        scaler
+    )
+
+def train_lstm_classifier(X, y, model_path):
+    if os.path.exists(model_path):
+        return load_model(model_path)
+
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=(X.shape[1], 1)),
+        LSTM(50),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+    model.fit(X, y, epochs=10, batch_size=32, verbose=0)
+    model.save(model_path)
+    return model
+
+def train_lstm_regressor(X, y, model_path):
+    if os.path.exists(model_path):
+        return load_model(model_path)
+
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=(X.shape[1], 1)),
+        LSTM(50),
+        Dense(1)
+    ])
+    model.compile(loss='mean_squared_error', optimizer='adam')
+    model.fit(X, y, epochs=10, batch_size=32, verbose=0)
+    model.save(model_path)
+    return model
+
+@app.route('/api/prediction', methods=['GET'])
+def predict_stock():
+    try:
+        # Step 1: Get User Inputs
+        ticker_name = request.args.get('name')
+        months = int(request.args.get('month'))
+        sequence_length = 60
+
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=months * 30)
+        ticker = yf.Ticker(ticker_name)
+
+        # Step 2: Download and Preprocess Data
+        #stock_data = download_data(ticker, start_date, end_date)
+        stock_data = ticker.history(start = start_date, end = end_date)
+        X_class, y_class, _, scaler_class = create_lstm_data(stock_data, sequence_length)
+        X_reg, _, y_reg, scaler_reg = create_lstm_data(stock_data, sequence_length)
+
+        # Step 3: Validate Dataset Size
+        if len(X_class) == 0 or len(X_reg) == 0:
+            raise ValueError("Insufficient data. Use a larger date range or shorter sequence length.")
+
+        # Step 4: Split & Reshape Data
+        test_size = min(0.2, len(X_class) / 2)
+        X_train_class, X_test_class, y_train_class, y_test_class = train_test_split(X_class, y_class, test_size=test_size, random_state=42)
+        X_train_reg, X_test_reg, y_train_reg, y_test_reg = train_test_split(X_reg, y_reg, test_size=test_size, random_state=42)
+
+        if len(X_train_class) < 10 or len(X_train_reg) < 10:
+            raise ValueError("Training data too small for meaningful training.")
+
+        # Reshape all inputs for LSTM
+        X_train_class = X_train_class.reshape((-1, sequence_length, 1))
+        X_test_class  = X_test_class.reshape((-1, sequence_length, 1))
+        X_train_reg   = X_train_reg.reshape((-1, sequence_length, 1))
+        X_test_reg    = X_test_reg.reshape((-1, sequence_length, 1))
+
+        # Step 5: Train or Load Models
+        model_class_path = os.path.join(MODEL_DIR, f"{ticker_name}_{months}_classifier.h5")
+        model_reg_path   = os.path.join(MODEL_DIR, f"{ticker_name}_{months}_regressor.h5")
+
+        model_class = train_lstm_classifier(X_train_class, y_train_class, model_class_path)
+        model_reg   = train_lstm_regressor(X_train_reg, y_train_reg, model_reg_path)
+
+        # Step 6: Make Predictions
+        recent_data_class = X_class[-1].reshape((1, sequence_length, 1))
+        movement_prob = model_class.predict(recent_data_class)[0][0]
+        movement = "Increase" if movement_prob > 0.5 else "Decrease"
+
+        recent_data_reg = X_reg[-1].reshape((1, sequence_length, 1))
+        predicted_price_scaled = model_reg.predict(recent_data_reg)[0][0]
+        predicted_price = scaler_reg.inverse_transform([[predicted_price_scaled]])[0][0]
+
+        # Step 7: Output
+        start_price = stock_data['Close'].iloc[0]
+        end_price = stock_data['Close'].iloc[-1]
+
+        return jsonify({
+            'sdp': start_price,
+            'edp': end_price,
+            'move': movement,
+            'ndp': predicted_price
+        }), 200
+
+    except Exception as e:
+        print(f"Prediction Error: {str(e)}")  # Useful during debugging
+        return jsonify({'error': str(e)}), 500
+ 
+
+@app.route('/api/ml3', methods=['GET'])
+def get_stock_dataa():
+        # Get the 'ind' query parameter
+    try:
+        ind = request.args.get('ind')
+
+        # Handle missing or invalid 'ind'
+        if ind is None:
+            return jsonify({'error': 'Parameter "ind" is missing'}), 400
+
+        
+        # Split the string into a list
+        ind_list = ind.split(',')
+        # print(ind_list)
+        # print(ind_list[0])    
+        #find the open, close, high, low, volume, and date of the stocks in the list for last date and return them in an array of objects
+        formatted_data = []
+        for i in ind_list:
+            ticker = yf.Ticker(i)
+            hist = ticker.history(period='1mo')
+            info = dict(ticker.fast_info)
+            data_point = {
+                'Date': hist.index[len(hist)-1].strftime('%Y-%m-%d'),
+                'Open': float(hist['Open'].iloc[-1]),
+                'High': float(hist['High'].iloc[-1]),
+                'Low': float(hist['Low'].iloc[-1]),
+                'Close': float(hist['Close'].iloc[-1]),
+                'Volume': int(hist['Volume'].iloc[-1]),
+                'symbol': i,
+                'fiftyTwoWeekHigh': info.get('fiftyTwoWeekHigh', 'USD'),
+                'fiftyTwoWeekLow': info.get('fiftyTwoWeekLow', 'USD'),
+                'fiftyDayAverage': info.get('fiftyDayAverage', 'USD'),   
+                'CompanyName': info.get('longName', i),     
+            }
+            formatted_data.append(data_point)
+        return jsonify({'data': formatted_data}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    
+@app.route('/api/news', methods=['GET'])
+def get_news_data():
+    tick= request.args.get('tick')
+    try:
+        ticker = yf.Ticker(tick)
+        news = ticker.news
+        return jsonify({'data': news}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    
+
+@app.route('/api/strategy', methods=['GET'])
+def get_strategy_data():
+    try:
+        # Get parameters from the request
+        ticker_name = request.args.get('name')
+        months = int(request.args.get('month'))
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=months * 30)
+        
+        ticker = yf.Ticker(ticker_name)
+        
+        # Fetch historical data
+        ticker_data = ticker.history(start=start_date, end=end_date)
+        if ticker_data.empty:
+            return jsonify({"error": "Invalid ticker name or no data found"}), 404
+        
+        # Ensure data integrity
+        ticker_data = ticker_data.dropna()
+
+        # Bollinger Bands Strategy (BBS)
+        def calculate_bollinger_bands(data, window=20):
+            data['SMA'] = data['Close'].rolling(window).mean()
+            data['STD'] = data['Close'].rolling(window).std()
+            data['BB_upper'] = data['SMA'] + (2 * data['STD'])
+            data['BB_lower'] = data['SMA'] - (2 * data['STD'])
+            return data
+
+        ticker_data = calculate_bollinger_bands(ticker_data)
+
+        def bbs_signal(row):
+            if row['Close'] < row['BB_lower']:
+                return 1  # Buy
+            elif row['Close'] > row['BB_upper']:
+                return -1  # Sell
+            else:
+                return 0  # Hold
+
+        ticker_data['BBS'] = ticker_data.apply(bbs_signal, axis=1)
+
+        # Moving Average Crossover Strategy (MAC)
+        def calculate_moving_averages(data, short_window=9, long_window=21):
+            data['Short_MA'] = data['Close'].rolling(short_window).mean()
+            data['Long_MA'] = data['Close'].rolling(long_window).mean()
+            return data
+
+        ticker_data = calculate_moving_averages(ticker_data)
+
+        def mac_signal(row):
+            if row['Short_MA'] > row['Long_MA']:
+                return 1  # Buy
+            elif row['Short_MA'] < row['Long_MA']:
+                return -1  # Sell
+            else:
+                return 0  # Hold
+
+        ticker_data['MAC'] = ticker_data.apply(mac_signal, axis=1)
+
+        # RSI Strategy (RSIS)
+        def calculate_rsi(data, window=14):
+            delta = data['Close'].diff()
+            gain = delta.where(delta > 0, 0)
+            loss = -delta.where(delta < 0, 0)
+            avg_gain = gain.rolling(window).mean()
+            avg_loss = loss.rolling(window).mean()
+            rs = avg_gain / avg_loss
+            data['RSI'] = 100 - (100 / (1 + rs))
+            return data
+
+        ticker_data = calculate_rsi(ticker_data)
+
+        def rsi_signal(rsi_value):
+            if rsi_value < 30:
+                return 1  # Buy
+            elif rsi_value > 70:
+                return -1  # Sell
+            else:
+                return 0  # Hold
+
+        ticker_data['RSIS'] = ticker_data['RSI'].apply(lambda x: rsi_signal(x) if pd.notna(x) else 0)
+
+        # Exponential Moving Average Crossover Strategy (EMA)
+        def calculate_ema(data, short_window=12, long_window=26):
+            data['Short_EMA'] = data['Close'].ewm(span=short_window, adjust=False).mean()
+            data['Long_EMA'] = data['Close'].ewm(span=long_window, adjust=False).mean()
+            return data
+
+        ticker_data = calculate_ema(ticker_data)
+
+        def ema_signal(row):
+            if row['Short_EMA'] > row['Long_EMA']:
+                return 1  # Buy
+            elif row['Short_EMA'] < row['Long_EMA']:
+                return -1  # Sell
+            else:
+                return 0  # Hold
+
+        ticker_data['EMA'] = ticker_data.apply(ema_signal, axis=1)
+
+        # Stochastic Oscillator Strategy
+        def calculate_stochastic(data, k_window=14, d_window=3):
+            data['L14'] = data['Low'].rolling(window=k_window).min()
+            data['H14'] = data['High'].rolling(window=k_window).max()
+            data['%K'] = (data['Close'] - data['L14']) / (data['H14'] - data['L14']) * 100
+            data['%D'] = data['%K'].rolling(window=d_window).mean()
+            return data
+
+        ticker_data = calculate_stochastic(ticker_data)
+
+        def stochastic_signal(row):
+            if row['%K'] < 20 and row['%K'] < row['%D']:
+                return 1  # Buy
+            elif row['%K'] > 80 and row['%K'] > row['%D']:
+                return -1  # Sell
+            else:
+                return 0  # Hold
+
+        ticker_data['Stochastic'] = ticker_data.apply(stochastic_signal, axis=1)
+
+        # Average True Range (ATR)
+        def calculate_atr(data, window=14):
+            data['TR'] = data[['High', 'Low', 'Close']].apply(
+                lambda x: max(x[0] - x[1], abs(x[0] - x[2]), abs(x[1] - x[2])), axis=1)
+            data['ATR'] = data['TR'].rolling(window).mean()
+            return data
+
+        ticker_data = calculate_atr(ticker_data)
+
+        def atr_signal(row, threshold=0.05):
+            if row['ATR'] / row['Close'] > threshold:
+                return 1  # Buy
+            else:
+                return 0  # Hold
+
+        ticker_data['ATR_Signal'] = ticker_data.apply(lambda row: atr_signal(row), axis=1)
+
+        # Collect the most recent signals
+        allresult = {
+            'BBS': int(ticker_data['BBS'].iloc[-1]),
+            'MAC': int(ticker_data['MAC'].iloc[-1]),
+            'RSIS': int(ticker_data['RSIS'].iloc[-1]),
+            'EMA': int(ticker_data['EMA'].iloc[-1]),
+            'Stochastic': int(ticker_data['Stochastic'].iloc[-1]),
+            'ATR': int(ticker_data['ATR_Signal'].iloc[-1])
+        }
+
+        return jsonify(allresult)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/ml2', methods=['GET'])
+def get_stock_data():
+    try:
+        ticker_name = request.args.get('name')
+        months = int(request.args.get('month', 1))
+
+        if not ticker_name:
+            return jsonify({'error': 'Ticker name is required'}), 400
+
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=months * 30)
+
+        ticker = yf.Ticker(ticker_name)
+
+        try:
+            hist = ticker.history(start=start_date, end=end_date)
+        except Exception as e:
+            return jsonify({'error': f'Failed to fetch history: {str(e)}'}), 500
+
+        if hist.empty:
+            return jsonify({'error': 'No data found for the given ticker and time range.'}), 404
+        info = ticker.info
+
+        company_name = info.get('longName', ticker_name)
+        currency = info.get('currency', 'USD')
+
+        formatted_data = []
+        for i in range(len(hist)):
+            data_point = {
+                'Date': hist.index[i].strftime('%Y-%m-%d'),
+                'Open': float(hist['Open'].iloc[i]),
+                'High': float(hist['High'].iloc[i]),
+                'Low': float(hist['Low'].iloc[i]),
+                'Close': float(hist['Close'].iloc[i]),
+                'Volume': int(hist['Volume'].iloc[i]),
+                'CompanyName': company_name,
+                'Currency': currency
+            }
+            formatted_data.append(data_point)
+
+        return jsonify({'data': formatted_data, 'info': info}), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/indicator', methods=['GET'])
+def get_indicator_data():
+    try:
+        ticker_name = request.args.get('name')
+        months = int(request.args.get('month', 1))
+        indicator = request.args.get('indicator')
+
+        if not ticker_name or not indicator:
+            return jsonify({'error': 'Ticker name and indicator are required'}), 400
+
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=months * 30)
+
+        ticker = yf.Ticker(ticker_name)
+        hist = ticker.history(start=start_date, end=end_date)
+
+        if hist.empty:
+            return jsonify({'error': 'No historical data found'}), 404
+
+        formatted_data = []
+
+        if indicator == 'SMA':
+            sma = hist['Close'].rolling(window=20).mean()
+            for i in range(len(hist)):
+                if pd.notnull(sma.iloc[i]):
+                    formatted_data.append({
+                        'Date': hist.index[i].strftime('%Y-%m-%d'),
+                        'Close': float(hist['Close'].iloc[i]),
+                        'SMA': float(sma.iloc[i])
+                    })
+        elif indicator == 'EMA':
+            ema = hist['Close'].ewm(span=20, adjust=False).mean()
+            for i in range(len(hist)):
+                if pd.notnull(ema.iloc[i]):
+                    formatted_data.append({
+                        'Date': hist.index[i].strftime('%Y-%m-%d'),
+                        'Close': float(hist['Close'].iloc[i]),
+                        'EMA': float(ema.iloc[i])
+                    })
+        elif indicator == 'RSI':
+            delta = hist['Close'].diff()
+            gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+            loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            for i in range(len(hist)):
+                if pd.notnull(rsi.iloc[i]):
+                    formatted_data.append({
+                        'Date': hist.index[i].strftime('%Y-%m-%d'),
+                        'Close': float(hist['Close'].iloc[i]),
+                        'RSI': float(rsi.iloc[i])
+                    })
+        elif indicator == 'MACD':
+            ema_12 = hist['Close'].ewm(span=12, adjust=False).mean()
+            ema_26 = hist['Close'].ewm(span=26, adjust=False).mean()
+            macd = ema_12 - ema_26
+            signal = macd.ewm(span=9, adjust=False).mean()
+            for i in range(len(hist)):
+                if pd.notnull(macd.iloc[i]) and pd.notnull(signal.iloc[i]):
+                    formatted_data.append({
+                        'Date': hist.index[i].strftime('%Y-%m-%d'),
+                        'MACD': float(macd.iloc[i]),
+                        'Signal': float(signal.iloc[i])
+                    })
+        elif indicator == 'BB':
+            sma = hist['Close'].rolling(window=20).mean()
+            std = hist['Close'].rolling(window=20).std()
+            upper = sma + 2 * std
+            lower = sma - 2 * std
+            for i in range(len(hist)):
+                if pd.notnull(upper.iloc[i]) and pd.notnull(lower.iloc[i]):
+                    formatted_data.append({
+                        'Date': hist.index[i].strftime('%Y-%m-%d'),
+                        'Close': float(hist['Close'].iloc[i]),
+                        'Upper': float(upper.iloc[i]),
+                        'Lower': float(lower.iloc[i])
+                    })
+        elif indicator == 'SO':
+            low_14 = hist['Low'].rolling(window=14).min()
+            high_14 = hist['High'].rolling(window=14).max()
+            k = 100 * (hist['Close'] - low_14) / (high_14 - low_14)
+            d = k.rolling(window=3).mean()
+            for i in range(len(hist)):
+                if pd.notnull(k.iloc[i]) and pd.notnull(d.iloc[i]):
+                    formatted_data.append({
+                        'Date': hist.index[i].strftime('%Y-%m-%d'),
+                        'K': float(k.iloc[i]),
+                        'D': float(d.iloc[i])
+                    })
+        elif indicator == 'ATR':
+            tr1 = hist['High'] - hist['Low']
+            tr2 = abs(hist['High'] - hist['Close'].shift())
+            tr3 = abs(hist['Low'] - hist['Close'].shift())
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(window=14).mean()
+            for i in range(len(hist)):
+                if pd.notnull(atr.iloc[i]):
+                    formatted_data.append({
+                        'Date': hist.index[i].strftime('%Y-%m-%d'),
+                        'ATR': float(atr.iloc[i])
+                    })
+        elif indicator == 'IC':
+            ic = (hist['High'] + hist['Low'] + hist['Close']) / 3
+            for i in range(len(hist)):
+                if pd.notnull(ic.iloc[i]):
+                    formatted_data.append({
+                        'Date': hist.index[i].strftime('%Y-%m-%d'),
+                        'IC': float(ic.iloc[i])
+                    })
+        elif indicator == 'VWAP':
+            tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
+            vwap = (tp * hist['Volume']).cumsum() / hist['Volume'].cumsum()
+            for i in range(len(hist)):
+                if pd.notnull(vwap.iloc[i]):
+                    formatted_data.append({
+                        'Date': hist.index[i].strftime('%Y-%m-%d'),
+                        'VWAP': float(vwap.iloc[i])
+                    })
+        elif indicator == 'MFI':
+            tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
+            raw_mf = tp * hist['Volume']
+            change = tp.diff()
+            pos_flow = (change.where(change > 0, 0) * hist['Volume']).rolling(window=14).sum()
+            neg_flow = (-change.where(change < 0, 0) * hist['Volume']).rolling(window=14).sum()
+            mfr = pos_flow / neg_flow
+            mfi = 100 - (100 / (1 + mfr))
+            for i in range(len(hist)):
+                if pd.notnull(mfi.iloc[i]):
+                    formatted_data.append({
+                        'Date': hist.index[i].strftime('%Y-%m-%d'),
+                        'MFI': float(mfi.iloc[i])
+                    })
+        else:
+            return jsonify({'error': 'Invalid indicator'}), 400
+
+        return jsonify({'data': formatted_data})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
