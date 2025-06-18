@@ -22,14 +22,14 @@ Stock-Price-Prediction/
 │   ├── src/                    # React source files
 │   └── package.json            # Frontend dependencies
 │
-├── predictor/                  # Python ML Engine (Flask + LSTM)
+├── scripts/                    # Python ML Engine (Flask + LSTM)
 │   └── main.py                 # LSTM orchestration script (data prep, train, predict)
 │
 ├── data/                       # Historical stock data (.csv)
 │
 ├── models/                     # Trained TensorFlow/Keras model files
 │
-├── requirements.txt            # Python dependency list (for Predictor)
+├── requirements.txt            # Python dependency list (for Scripts)
 │
 └── README.md                   # Project documentation
 
@@ -64,7 +64,7 @@ Stock-Price-Prediction/
 cd Stock-Price-Prediction
 
 2. Set Up Predictor (Flask ML API)
-cd predictor/
+cd scripts/
 python -m venv venv
 source venv/bin/activate     # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
@@ -93,7 +93,7 @@ Install with: pip install -r requirements.txt
 
 ▶️ Usage Instructions
 
-Modify ticker symbol and date range in predictor/main.py or API params.
+Modify ticker symbol and date range in scripts/main.py or API params.
 
 Start Flask + React apps, then open http://localhost:5000.
 
@@ -153,7 +153,6 @@ Siddhant Mishra
 
 Aarti Kumari
 
-Sachin Bharti
 
 Supervised by Dr. Tiya Dey Malakar & Dr. Ashoke Mondal
 RCC Institute of Information Technology, Kolkata – 2025
