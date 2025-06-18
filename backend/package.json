@@ -1,0 +1,33 @@
+{
+  "name": "v1back",
+  "version": "1.0.0",
+  "description": "Backend for stock market analysis and prediction",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "lint": "eslint ."
+  },
+  "author": "SIDDHANT MISHRA",
+  "license": "ISC",
+  "dependencies": {
+    "@eslint/config-array": "^0.20.0",
+    "@eslint/object-schema": "^2.1.6",
+    "axios": "^1.9.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "glob": "^11.0.2",
+    "helmet": "^8.1.0",
+    "mongoose": "^8.15.1",
+    "morgan": "^1.10.0",
+    "rimraf": "^6.0.1",
+    "ta-lib": "^0.11.0",
+    "technicalindicators": "^3.1.0",
+    "yahoo-finance2": "^2.13.3"
+  },
+  "devDependencies": {
+    "eslint": "^9.27.0",
+    "nodemon": "^3.1.10"
+  }
+}
